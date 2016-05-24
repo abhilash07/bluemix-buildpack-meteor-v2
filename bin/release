@@ -1,8 +1,8 @@
-cat <<-YAML
+cat <<EOF
 ---
 addons:
   - mongohq:sandbox
 config_vars:
 default_process_types:
   web: .bluemix/bin/node .bluemix/app/main.js
-YAML
+EOF
