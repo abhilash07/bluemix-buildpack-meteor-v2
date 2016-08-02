@@ -1,82 +1,153 @@
 #!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir>
 
-# Looking for ".meteor" directory
-if [ -d $1/".meteor" ]; then
-  # ".meteor" directory found in main directory
-  APP_DIR=$1
-else
-  # Try to find ".meteor" directory in subdirectories
-  APP_DIR=$(find $1 -type d -name ".meteor" 2>/dev/null -print -quit)
-  # Check if ".meteor" directory was found
-  if [ ! -z "$APP_DIR" ]; then
-    # Remove ".meteor" substring from "APP_DIR" variable
-    APP_DIR=$(dirname $APP_DIR)
-  fi
-fi
+# fail fast
+set -e
 
-# Create some variables.
-BUILDPACK_DIR=$(cd $(dirname $0); cd ..; pwd)
+# debug
+# set -x
+
+# clean up leaking environment
+unset GIT_DIR
+
+# parse and derive params
 BUILD_DIR=$1
 CACHE_DIR=$2
-ENV_DIR=$3
-COMPILE_DIR=$BUILD_DIR"/.bluemix"
-COMPILE_BIN_DIR=$COMPILE_DIR"/bin" # Link for Node is stored here.
-COMPILE_APP_DIR=$COMPILE_DIR"/app" # Built Meteor application is stored here.
-TEMP_DIR=$(mktemp -d $BUILDPACK_DIR"/temp-XXXX")
+LP_DIR=`cd $(dirname $0); cd ..; pwd`
 
-# Create directories.
-mkdir -p $COMPILE_BIN_DIR $COMPILE_APP_DIR
+[ ! -d $BUILD_DIR ] && mkdir $BUILD_DIR
+[ ! -d $CACHE_DIR ] && mkdir $CACHE_DIR
 
-# Load some convenience functions like status(), echo(), and indent().
-source $BUILDPACK_DIR"/bin/common.sh"
+function error() {
+  echo " !     $*"
+  exit 1
+}
 
-#
-# Install Node
-#
-status "Installing Node"
-#NODE_VERSION=$(curl -sS --get https://semver.io/node/resolve)
-NODE_URL="http://nodejs.org/dist/v0.10.40/node-v0.10.40-linux-x64.tar.gz"
-curl -sS $NODE_URL -o - | tar -zxf - -C $COMPILE_DIR --strip 1
-export npm_config_prefix=$COMPILE_DIR
-export CPATH=$CPATH:$COMPILE_DIR"/include"
-export CPPPATH=$CPATH
-export PATH=$PATH:$COMPILE_BIN_DIR
+function mktmpdir() {
+  dir=$(mktemp -t node-$1-XXXX)
+  rm -rf $dir
+  mkdir -p $dir
+  echo $dir
+}
 
-#
-# Install Meteor
-#
-status "Installing Meteor"
-curl -sS https://install.meteor.com/ | sh
-export PATH=$PATH:$HOME"/.meteor"
+function indent() {
+  c='s/^/       /'
+  case $(uname) in
+    Darwin) sed -l "$c";;
+    *)      sed -u "$c";;
+  esac
+}
 
-#
-# Build Meteor application
-#
-status "Building Meteor application"
-cd $APP_DIR && meteor build --directory $TEMP_DIR
-mv $TEMP_DIR"/bundle/"* $COMPILE_APP_DIR
+function run_npm() {
+  command="$1"
 
-#
-# Install dependencies.
-#
-status "Installing dependencies"
-if [ -e $COMPILE_APP_DIR"/programs/server/package.json" ]; then
-  cd $COMPILE_APP_DIR"/programs/server" && (npm install | indent)
+  cd "$BUILD_DIR"
+  HOME="$BUILD_DIR" $VENDORED_NODE/bin/node $VENDORED_NODE/bin/npm $command 2>&1 | indent
+
+  if [ "${PIPESTATUS[*]}" != "0 0" ]; then
+    echo " !     Failed to $command dependencies with npm"
+    exit 1
+  fi
+}
+
+function package_download() {
+  engine="$1"
+  version="$2"
+  location="$3"
+
+  mkdir -p $location
+
+  package="http://nodejs.org/dist/v$version/$engine-v$version-linux-x64.tar.gz"
+  echo " - downloading and extracting $engine from $package" | indent
+  curl $package -s -o - | tar -zxf  - -C $location --strip 1
+}
+
+echo "-----> Resolving engine versions"
+
+#TODO: Fix package.json loading
+#if [ -f "${BUILD_DIR}/package.json" ]; then
+#  requested_node_ver=$(cat $BUILD_DIR/package.json | $LP_DIR/vendor/jq -r .engines.node)
+#fi
+#temporary - load from nodeversion
+requested_node_ver=""
+if [ -f "${BUILD_DIR}/nodeversion" ]; then
+  echo " - nodeversion file detected, using for semvar" | indent
+  requested_node_ver=$(cat $BUILD_DIR/nodeversion)
+  echo " - requested version: $requested_node_ver" | indent
+fi
+# add a warning if no version of node specified
+if [ "$requested_node_ver" == "" ]; then
+  requested_node_ver="0.10.*"
+  echo
+  echo "No version of Node.js specified in nodeversion, using '${requested_node_ver}'" | indent
+  echo
 fi
 
-#
-# Build runtime environment
-#
-# Add an export of PATH which includes our compile dir.
-status "Building runtime environment"
-mkdir -p $BUILD_DIR"/.profile.d"
-echo "export PATH=\$COMPILE_BIN_DIR:\$PATH" > $BUILD_DIR"/.profile.d/nodejs.sh"
+NODE_VERSION=$(curl --silent --get --data-urlencode "range=${requested_node_ver}" https://semver.io/node/resolve)
+echo "Using Node.js version: ${NODE_VERSION}" | indent
 
-#
-# Extras
-#
-# Source scripts from "extra" dir.
-status "Running extras"
-for file in $(ls $BUILDPACK_DIR"/extra" | sort); do
-  . $BUILDPACK_DIR"/extra/"$file
-done
+# vendor directories
+VENDORED_NODE="$(mktmpdir node)"
+VENDORED_MODULES="$(mktmpdir modules)"
+
+# download and unpack packages
+echo "-----> Fetching Node.js binaries"
+package_download "node" "${NODE_VERSION}" "${VENDORED_NODE}"
+
+# setting up paths for building
+PATH="$VENDORED_NODE/bin:$VENDORED_MODULES/bin:$PATH"
+INCLUDE_PATH="$VENDORED_NODE/include"
+export npm_config_prefix="$VENDORED_MODULES"
+export CPATH="$INCLUDE_PATH"
+export CPPPATH="$INCLUDE_PATH"
+
+
+METEOR_BUILD_DIR="$BUILD_DIR/.meteor/meteor_build"
+mkdir -p "$HOME"
+############################################
+# install meteor + packages
+# and install into app/
+############################################
+cd $BUILD_DIR
+
+# Using different folder to prevent install script form deleting packages file
+VENDORED_METEOR="$(mktmpdir meteor)"
+
+APP_VERSION=`cat "$BUILD_DIR/.meteor/release"`
+APP_VERSION=${APP_VERSION:7} # remove "METEOR@" to leave only semver number
+echo "Installing meteor $APP_VERSION" | indent
+
+curl -# "https://install.meteor.com?release=$APP_VERSION" | HOME="$VENDORED_METEOR" /bin/sh | indent
+echo "Meteor $APP_VERSION installed" | indent
+
+echo "Ignoring build of mobile platforms"
+sed -i '/^ios$/d;/^android$/d' ./.meteor/platforms
+
+echo "Building meteor bundle" | indent
+mkdir -p "$METEOR_BUILD_DIR"/app
+HOME="$VENDORED_METEOR" "$VENDORED_METEOR"/.meteor/meteor build "$METEOR_BUILD_DIR"/app --directory 2>&1 | indent
+
+echo "Installing meteor bundle" | indent
+(cd "$METEOR_BUILD_DIR"/app/bundle/programs/server && HOME="$BUILD_DIR" $VENDORED_NODE/bin/node $VENDORED_NODE/bin/npm install 2>&1 | indent)
+
+############################################
+
+############################################
+# Prepare ENV vars
+############################################
+echo "Setting up MONGO_URL in .profile.d"
+
+mkdir -p "$BUILD_DIR"/.profile.d
+cat | tee "$BUILD_DIR"/.profile.d/mongo.sh <<EOF
+  #!/bin/sh
+
+  export ROOT_URL=`echo \$ROOT_URL`
+  export MONGO_URL=`echo \$MONGO_URL`
+
+EOF
+
+# vendor node into the slug
+PATH="$METEOR_BUILD_DIR/bin:$PATH"
+echo "-----> Vendoring node into slug"
+mkdir -p "$METEOR_BUILD_DIR/bin"
+cp "$VENDORED_NODE/bin/node" "$METEOR_BUILD_DIR/bin/node"
